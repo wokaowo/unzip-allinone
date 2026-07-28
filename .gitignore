@@ -1,0 +1,9 @@
+# Local tooling metadata
+.agents/
+.codex
+
+# Go build and test outputs
+/unzip-allinone
+/unzip-allinone.exe
+*.test
+coverage.out

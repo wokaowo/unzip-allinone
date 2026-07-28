@@ -1,0 +1,289 @@
+<!doctype html>
+<html lang="zh-CN">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1, viewport-fit=cover">
+  <meta name="color-scheme" content="light dark">
+  <meta name="theme-color" content="#f5f5f7" media="(prefers-color-scheme: light)">
+  <meta name="theme-color" content="#000000" media="(prefers-color-scheme: dark)">
+  <title>Unzip — 批量解压</title>
+  <link rel="stylesheet" href="/app.css">
+</head>
+<body>
+  <div class="ambient" aria-hidden="true"></div>
+
+  <header class="topbar">
+    <div class="topbar-inner">
+      <div class="brand">
+        <span class="brand-mark" aria-hidden="true">
+          <svg viewBox="0 0 32 32" width="28" height="28" fill="none">
+            <rect x="2" y="2" width="28" height="28" rx="8" fill="url(#bm)"/>
+            <path d="M10 14.5h12M10 18h8" stroke="#fff" stroke-width="1.8" stroke-linecap="round"/>
+            <path d="M16 9v10.5m0 0-3.2-3.2M16 19.5l3.2-3.2" stroke="#fff" stroke-width="1.8" stroke-linecap="round" stroke-linejoin="round"/>
+            <defs>
+              <linearGradient id="bm" x1="2" y1="2" x2="30" y2="30">
+                <stop stop-color="#0A84FF"/>
+                <stop offset="1" stop-color="#5E5CE6"/>
+              </linearGradient>
+            </defs>
+          </svg>
+        </span>
+        <div class="brand-text">
+          <strong>Unzip</strong>
+          <span>All-in-One</span>
+        </div>
+      </div>
+
+      <nav class="step-rail" aria-label="流程步骤">
+        <div class="step is-active" data-step="1">
+          <span class="step-index">1</span>
+          <span class="step-label">选择位置</span>
+        </div>
+        <div class="step-divider" aria-hidden="true"></div>
+        <div class="step" data-step="2">
+          <span class="step-index">2</span>
+          <span class="step-label">确认文件</span>
+        </div>
+        <div class="step-divider" aria-hidden="true"></div>
+        <div class="step" data-step="3">
+          <span class="step-index">3</span>
+          <span class="step-label">解压</span>
+        </div>
+      </nav>
+
+      <div class="status-pill" id="serverState" data-state="idle">
+        <span class="status-dot" aria-hidden="true"></span>
+        <span class="status-text">就绪</span>
+      </div>
+    </div>
+  </header>
+
+  <div class="toast-host" id="toastHost" aria-live="polite" aria-relevant="additions"></div>
+
+  <main class="shell">
+    <div class="resume-banner" id="resumeBanner" hidden role="status"></div>
+
+    <section class="workspace">
+      <aside class="sidebar glass" aria-label="目录浏览器">
+        <div class="panel-head">
+          <div>
+            <p class="panel-kicker">位置</p>
+            <h2>文件夹</h2>
+          </div>
+          <button class="icon-button" id="upButton" title="上一级" aria-label="上一级" type="button">
+            <svg viewBox="0 0 20 20" width="18" height="18" fill="none" aria-hidden="true">
+              <path d="M10 15V5m0 0L5.5 9.5M10 5l4.5 4.5" stroke="currentColor" stroke-width="1.7" stroke-linecap="round" stroke-linejoin="round"/>
+            </svg>
+          </button>
+        </div>
+
+        <label class="field-label" for="rootPath">当前路径</label>
+        <div class="path-row">
+          <input id="rootPath" class="control path-input" autocomplete="off" spellcheck="false" placeholder="/path/to/archives">
+          <button id="openPathButton" class="btn btn-secondary" type="button">进入</button>
+          <button id="copyPathButton" class="icon-button" type="button" title="复制路径" aria-label="复制路径">
+            <svg viewBox="0 0 20 20" width="16" height="16" fill="none" aria-hidden="true">
+              <rect x="7" y="7" width="9" height="10" rx="2" stroke="currentColor" stroke-width="1.5"/>
+              <path d="M13 7V5a2 2 0 0 0-2-2H5a2 2 0 0 0-2 2v6a2 2 0 0 0 2 2h2" stroke="currentColor" stroke-width="1.5" stroke-linecap="round"/>
+            </svg>
+          </button>
+        </div>
+        <nav class="breadcrumbs" id="breadcrumbs" aria-label="路径面包屑"></nav>
+
+        <div class="dir-list" id="dirList" aria-live="polite"></div>
+
+        <button id="scanButton" class="btn btn-primary btn-block" type="button">
+          <span class="btn-label">扫描此文件夹</span>
+          <span class="btn-spinner" aria-hidden="true"></span>
+        </button>
+        <p class="sidebar-hint">快捷键：<kbd>⌘/Ctrl</kbd>+<kbd>Enter</kbd> 扫描 · <kbd>Esc</kbd> 取消解压</p>
+
+        <details class="disclosure" id="advancedPanel">
+          <summary>
+            <span>扫描选项</span>
+            <svg class="chevron" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </summary>
+          <div class="disclosure-body">
+            <label class="field">
+              <span>扫描深度</span>
+              <select id="scanDepth" class="control">
+                <option value="3">3 层</option>
+                <option value="5" selected>5 层</option>
+                <option value="8">8 层</option>
+                <option value="12">12 层</option>
+              </select>
+            </label>
+            <label class="switch-row">
+              <span>包含隐藏项</span>
+              <input type="checkbox" id="includeHidden" class="switch-input">
+              <span class="switch-ui" aria-hidden="true"></span>
+            </label>
+          </div>
+        </details>
+      </aside>
+
+      <section class="content glass">
+        <div class="content-top">
+          <div class="content-title-block">
+            <p class="panel-kicker">结果</p>
+            <h2>压缩包</h2>
+            <p class="subtitle" id="summaryText">在左侧选择文件夹并扫描</p>
+          </div>
+          <div class="toolbar-actions" id="toolbarActions">
+            <button id="recommendedButton" class="btn btn-ghost" type="button" hidden>智能选择</button>
+            <button id="selectAllButton" class="btn btn-secondary" type="button">全选</button>
+            <button id="extractButton" class="btn btn-primary" type="button">
+              <span class="btn-label">开始解压</span>
+              <span class="btn-spinner" aria-hidden="true"></span>
+            </button>
+          </div>
+        </div>
+
+        <div class="stats-row" id="statsRow" hidden>
+          <div class="stat-chip"><span id="statTotal">0</span><label>全部</label></div>
+          <div class="stat-chip"><span id="statSelected">0</span><label>已选</label></div>
+          <div class="stat-chip"><span id="statMultipart">0</span><label>分卷</label></div>
+          <div class="stat-chip"><span id="statSize">0 B</span><label>总大小</label></div>
+        </div>
+
+        <div class="controls-bar" id="controlsBar" hidden>
+          <div class="search-field">
+            <svg class="search-icon" viewBox="0 0 20 20" width="16" height="16" aria-hidden="true">
+              <circle cx="8.5" cy="8.5" r="5.5" stroke="currentColor" stroke-width="1.6" fill="none"/>
+              <path d="M13 13l3.5 3.5" stroke="currentColor" stroke-width="1.6" stroke-linecap="round"/>
+            </svg>
+            <input id="searchInput" class="control search-input" placeholder="搜索文件名或路径" autocomplete="off">
+            <button type="button" class="search-clear" id="searchClear" hidden title="清除搜索" aria-label="清除搜索">×</button>
+          </div>
+          <div class="segmented" role="group" aria-label="筛选">
+            <button type="button" class="segment is-active" data-filter="all">全部 <em class="seg-count" data-count="all"></em></button>
+            <button type="button" class="segment" data-filter="selected">已选 <em class="seg-count" data-count="selected"></em></button>
+            <button type="button" class="segment" data-filter="pending">进行中 <em class="seg-count" data-count="pending"></em></button>
+            <button type="button" class="segment" data-filter="done">完成 <em class="seg-count" data-count="done"></em></button>
+            <button type="button" class="segment" data-filter="failed">失败 <em class="seg-count" data-count="failed"></em></button>
+          </div>
+          <select id="filterMode" class="control filter-select visually-hidden" aria-hidden="true" tabindex="-1">
+            <option value="all" selected>全部</option>
+            <option value="selected">已选</option>
+            <option value="pending">进行中</option>
+            <option value="done">完成</option>
+            <option value="failed">失败</option>
+          </select>
+        </div>
+
+        <div class="password-panel" id="passwordPanel" hidden>
+          <div class="password-panel-main">
+            <label class="field-label" for="globalPassword">统一密码</label>
+            <div class="password-input-row">
+              <input id="globalPassword" class="control" type="password" placeholder="留空则使用各项建议密码" autocomplete="off">
+              <button type="button" id="togglePasswordVisibility" class="btn btn-secondary btn-compact" title="显示/隐藏密码">显示</button>
+              <button id="applyPasswordButton" class="btn btn-secondary btn-compact" type="button">应用到已选</button>
+            </div>
+            <p class="hint-line" id="globalPasswordHint" hidden></p>
+            <p class="hint-line muted">支持黑话：<code>星</code>→* · <code>点斜点</code>→./. · <code>下划线</code>→_</p>
+          </div>
+        </div>
+
+        <div class="list-surface">
+          <div class="result-list" id="resultList">
+            <div class="empty-state" id="emptyState">
+              <div class="empty-icon" aria-hidden="true">
+                <svg viewBox="0 0 80 80" width="72" height="72" fill="none">
+                  <rect x="14" y="22" width="52" height="40" rx="10" stroke="currentColor" stroke-width="2" opacity=".35"/>
+                  <path d="M28 22v-2a8 8 0 0 1 8-8h8a8 8 0 0 1 8 8v2" stroke="currentColor" stroke-width="2" opacity=".35"/>
+                  <path d="M40 36v16m0 0-6-6m6 6 6-6" stroke="currentColor" stroke-width="2.2" stroke-linecap="round" stroke-linejoin="round"/>
+                </svg>
+              </div>
+              <h3>准备开始</h3>
+              <p>在左侧进入存放压缩包的文件夹，点击「扫描此文件夹」。支持 zip、7z 与分卷。</p>
+              <ol class="empty-steps">
+                <li>选择目录</li>
+                <li>扫描并确认列表</li>
+                <li>一键解压</li>
+              </ol>
+            </div>
+          </div>
+        </div>
+
+        <details class="disclosure result-disclosure" id="extractOptions">
+          <summary>
+            <span>解压选项</span>
+            <svg class="chevron" viewBox="0 0 16 16" width="14" height="14" aria-hidden="true"><path d="M4 6l4 4 4-4" fill="none" stroke="currentColor" stroke-width="1.6" stroke-linecap="round" stroke-linejoin="round"/></svg>
+          </summary>
+          <div class="disclosure-body two-col">
+            <label class="field">
+              <span>遇到同名文件</span>
+              <select id="conflictPolicy" class="control">
+                <option value="skip" selected>跳过已有文件</option>
+                <option value="rename">保留两份，自动改名</option>
+                <option value="overwrite">覆盖已有文件</option>
+              </select>
+            </label>
+            <label class="switch-row danger">
+              <span>
+                解压成功后删除原始分卷
+                <small>高风险，默认关闭</small>
+              </span>
+              <input type="checkbox" id="deleteOriginal" class="switch-input">
+              <span class="switch-ui" aria-hidden="true"></span>
+            </label>
+            <p class="safety-note">默认安全：不覆盖、不删除。确认无误后再开启高风险选项。</p>
+          </div>
+        </details>
+
+        <div class="job-result" id="jobResult" hidden></div>
+        <div class="retry-panel" id="retryPanel" hidden></div>
+
+        <div class="progress-panel" id="progressPanel" hidden>
+          <div class="progress-head">
+            <div>
+              <p class="panel-kicker">进度</p>
+              <h2>实时状态</h2>
+              <p class="subtitle" id="jobSummary">正在准备</p>
+              <p class="progress-meta" id="progressMeta" hidden>
+                <span id="progressCounts">0 / 0</span>
+                <span class="meta-dot" aria-hidden="true">·</span>
+                <span id="progressElapsed">00:00</span>
+              </p>
+            </div>
+            <div class="progress-head-actions">
+              <div class="overall-ring" id="overallRing" aria-hidden="true">
+                <svg viewBox="0 0 44 44" width="44" height="44">
+                  <circle class="ring-track" cx="22" cy="22" r="18" fill="none" stroke-width="3.5"/>
+                  <circle class="ring-value" id="overallRingValue" cx="22" cy="22" r="18" fill="none" stroke-width="3.5"
+                    stroke-linecap="round" transform="rotate(-90 22 22)"
+                    stroke-dasharray="113.1" stroke-dashoffset="113.1"/>
+                </svg>
+                <span class="overall-percent" id="overallPercent">0%</span>
+              </div>
+              <button id="cancelButton" class="btn btn-secondary" type="button">取消</button>
+            </div>
+          </div>
+          <div class="overall-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="overallBarHost">
+            <span id="overallBar"></span>
+          </div>
+          <div class="event-log" id="eventLog" aria-live="polite"></div>
+        </div>
+      </section>
+    </section>
+  </main>
+
+  <div class="action-dock" id="actionDock" hidden>
+    <div class="action-dock-inner">
+      <div class="action-dock-meta">
+        <strong id="dockCount">已选 0 项</strong>
+        <span id="dockHint">准备就绪，可开始解压</span>
+      </div>
+      <div class="action-dock-actions">
+        <button type="button" class="btn btn-secondary" id="dockSelectAll">全选</button>
+        <button type="button" class="btn btn-primary" id="dockExtract">
+          <span class="btn-label">开始解压</span>
+          <span class="btn-spinner" aria-hidden="true"></span>
+        </button>
+      </div>
+    </div>
+  </div>
+
+  <script src="/app.js"></script>
+</body>
+</html>
