@@ -88,6 +88,21 @@ const els = {
 
 const RING_CIRCUMFERENCE = 2 * Math.PI * 18;
 
+/* Terminal job statuses. "partial"/"failed" join "done"/"cancelled" so a job
+   where some or all archives failed is reported as such instead of a green ✓. */
+const TERMINAL_JOB_STATUSES = ["done", "partial", "failed", "cancelled"];
+
+const isTerminalJobStatus = (status) => TERMINAL_JOB_STATUSES.includes(status);
+
+const JOB_OUTCOME = {
+  done: { pill: "全部成功", kind: "done", title: "全部成功", icon: "✓", toast: "success" },
+  partial: { pill: "部分失败", kind: "warn", title: "部分完成", icon: "!", toast: "info" },
+  failed: { pill: "全部失败", kind: "error", title: "全部失败", icon: "✕", toast: "error" },
+  cancelled: { pill: "已取消", kind: "warn", title: "处理已取消", icon: "–", toast: "info" },
+};
+
+const outcomeOf = (status) => JOB_OUTCOME[status] || JOB_OUTCOME.done;
+
 /* ── Status & feedback ── */
 
 function setStateText(text, kind = "idle") {
@@ -95,20 +110,9 @@ function setStateText(text, kind = "idle") {
   if (!statusEl) return;
   const label = statusEl.querySelector(".status-text") || statusEl;
   label.textContent = text;
-
-  let stateKind = kind;
-  if (kind === "idle") {
-    if (text.includes("解压") || text.includes("扫描") || text.includes("读取") || text.includes("重连") || text.includes("取消")) {
-      stateKind = "busy";
-    } else if (text.includes("完成")) {
-      stateKind = "done";
-    } else if (text.includes("错误") || text.includes("失败") || text.includes("失效")) {
-      stateKind = "error";
-    } else if (text.includes("取消")) {
-      stateKind = "warn";
-    }
-  }
-  statusEl.dataset.state = stateKind;
+  // Callers always pass an explicit kind. Inferring it from the label text used
+  // to mis-tag states — "已取消" matched the "取消" busy rule and never reached warn.
+  statusEl.dataset.state = kind;
 }
 
 function toast(message, type = "info", duration = 3800) {
@@ -911,7 +915,7 @@ function openJobSocket(jobId) {
     try {
       const event = JSON.parse(msg.data);
       handleJobEvent(event);
-      if (event.type === "job" && ["done", "cancelled"].includes(event.status)) {
+      if (event.type === "job" && isTerminalJobStatus(event.status)) {
         finishJobClient(event.status);
       }
     } catch (err) {
@@ -934,7 +938,7 @@ function openJobSSE(jobId) {
     try {
       const event = JSON.parse(msg.data);
       handleJobEvent(event);
-      if (event.type === "job" && ["done", "cancelled"].includes(event.status)) {
+      if (event.type === "job" && isTerminalJobStatus(event.status)) {
         finishJobClient(event.status);
       }
     } catch (err) {
@@ -966,7 +970,7 @@ function scheduleReconnect(jobId) {
       const snap = await api(`/api/jobs/${encodeURIComponent(jobId)}`, { method: "GET", headers: {} });
       applyJobSnapshot(snap);
       if (snap.done) {
-        const terminal = snap.events.find((e) => e.type === "job" && ["done", "cancelled"].includes(e.status));
+        const terminal = snap.events.find((e) => e.type === "job" && isTerminalJobStatus(e.status));
         finishJobClient(terminal?.status || snap.status || "done");
         return;
       }
@@ -996,18 +1000,23 @@ function finishJobClient(status) {
   setBusy(false);
   tickElapsed();
   stopElapsedTimer();
-  setStateText(status === "done" ? "处理完成" : "已取消", status === "done" ? "done" : "warn");
+  const outcome = outcomeOf(status);
+  setStateText(outcome.pill, outcome.kind);
   updateButtons();
   updateDock();
   updateStepRail();
   updateSegmentCounts();
   hideResumeBanner();
-  if (status === "done") {
-    const failed = Array.from(state.events.values()).filter((e) => e.status === "failed").length;
-    if (failed) toast(`处理完成，${failed} 项失败可重试`, "info", 4200);
-    else toast("全部任务处理完成", "success");
-  } else if (status === "cancelled") {
+
+  const failed = Array.from(state.events.values()).filter((e) => e.status === "failed").length;
+  if (status === "cancelled") {
     toast("任务已取消", "info");
+  } else if (status === "failed") {
+    toast(`全部 ${failed || state.jobTotal} 项均失败，请检查密码或文件完整性`, "error", 5200);
+  } else if (failed) {
+    toast(`${failed} 项失败，可修改密码后重试`, "info", 4200);
+  } else {
+    toast("全部任务处理完成", "success");
   }
 }
 
@@ -1041,8 +1050,8 @@ function handleJobEvent(event) {
   if (event.type === "job") {
     if (event.message) els.jobSummary.textContent = event.message;
     if (event.total) state.jobTotal = event.total;
-    if (event.status === "done") setOverallProgress(100);
-    if (["done", "cancelled"].includes(event.status)) {
+    if (isTerminalJobStatus(event.status) && event.status !== "cancelled") setOverallProgress(100);
+    if (isTerminalJobStatus(event.status)) {
       state.lastJob = event;
       renderJobResult();
       renderRetryPanel();
@@ -1125,7 +1134,7 @@ function applyJobSnapshot(snap) {
     if (event.type === "job") {
       if (event.message) els.jobSummary.textContent = event.message;
       if (event.total) state.jobTotal = event.total;
-      if (["done", "cancelled"].includes(event.status)) state.lastJob = event;
+      if (isTerminalJobStatus(event.status)) state.lastJob = event;
       continue;
     }
     const key = event.archiveId || event.path;
@@ -1150,11 +1159,10 @@ function renderJobResult() {
   }[event.conflictPolicy || "skip"];
 
   const failedItems = Array.from(state.events.values()).filter((item) => item.status === "failed");
-  const isCancelled = event.status === "cancelled";
-  const icon = isCancelled ? "–" : "✓";
+  const outcome = outcomeOf(event.status);
 
   const errorSummary = failedItems.length
-    ? `<details class="error-summary"><summary>查看失败原因（${failedItems.length}）</summary>${failedItems
+    ? `<details class="error-summary" ${event.status === "failed" ? "open" : ""}><summary>查看失败原因（${failedItems.length}）</summary>${failedItems
         .map(
           (item) =>
             `<div class="error-item"><strong>${escapeHtml(item.archiveName || item.path || "文件")}</strong><span>${escapeHtml(
@@ -1168,19 +1176,19 @@ function renderJobResult() {
   els.jobResult.className = `job-result ${event.status || ""}`;
   els.jobResult.innerHTML = `
     <div class="job-result-head">
-      <div class="result-icon" aria-hidden="true">${icon}</div>
+      <div class="result-icon" aria-hidden="true">${outcome.icon}</div>
       <div>
-        <h3>${escapeHtml(isCancelled ? "处理已取消" : "处理完成")}</h3>
+        <h3>${escapeHtml(outcome.title)}</h3>
       </div>
     </div>
     <p>${escapeHtml(event.message || "")}</p>
     <div class="result-metrics">
-      <span class="result-metric ok">成功 ${event.successCount || 0}</span>
+      <span class="result-metric ${event.successCount ? "ok" : ""}">成功 ${event.successCount || 0}</span>
       <span class="result-metric ${event.failedCount ? "bad" : ""}">失败 ${event.failedCount || 0}</span>
-      ${event.warningCount ? `<span class="result-metric">告警 ${event.warningCount}</span>` : ""}
+      ${event.warningCount ? `<span class="result-metric warn">告警 ${event.warningCount}</span>` : ""}
     </div>
     <p>输出位置：每个压缩包所在文件夹 · 冲突处理：${escapeHtml(modeText)} · ${
-      event.deleteOriginal ? "已删除原始分卷" : "原始分卷已保留"
+      event.deleteOriginal ? "已删除原始压缩包（校验通过后）" : "原始压缩包已保留"
     }</p>
     ${errorSummary}
   `;
@@ -1287,8 +1295,9 @@ function updateOverall() {
   let sum = 0;
   for (const event of events) {
     let p = Number(event.percent) || 0;
-    if (event.status === "done" || event.status === "warning") p = 100;
-    if (event.status === "failed" || event.status === "cancelled") p = Math.max(p, 0);
+    // A finished archive contributes a full slice regardless of outcome —
+    // otherwise failures pin the overall bar below 100% after the job ends.
+    if (["done", "warning", "failed"].includes(event.status)) p = 100;
     sum += clamp(p);
   }
   setOverallProgress(Math.round(sum / total));
@@ -1419,7 +1428,7 @@ async function resumeJob(jobId, saved) {
 
     if (snap.done) {
       const terminal =
-        snap.events.find((e) => e.type === "job" && ["done", "cancelled"].includes(e.status)) || {
+        snap.events.find((e) => e.type === "job" && isTerminalJobStatus(e.status)) || {
           type: "job",
           status: snap.status || "done",
           message: snap.message,
@@ -1430,7 +1439,8 @@ async function resumeJob(jobId, saved) {
       clearActiveJob();
       state.currentJob = "";
       setBusy(false);
-      setStateText(terminal.status === "cancelled" ? "已取消" : "处理完成", terminal.status === "cancelled" ? "warn" : "done");
+      const restoredOutcome = outcomeOf(terminal.status);
+      setStateText(restoredOutcome.pill, restoredOutcome.kind);
       showResumeBanner("已恢复上次任务的最终结果。");
       renderArchives();
       return true;
@@ -1604,7 +1614,7 @@ document.addEventListener("visibilitychange", () => {
       .then((snap) => {
         applyJobSnapshot(snap);
         if (snap.done) {
-          const terminal = snap.events.find((e) => e.type === "job" && ["done", "cancelled"].includes(e.status));
+          const terminal = snap.events.find((e) => e.type === "job" && isTerminalJobStatus(e.status));
           finishJobClient(terminal?.status || snap.status || "done");
         } else if (!state.socket && !state.eventSource) {
           connectJobProgress(state.currentJob);

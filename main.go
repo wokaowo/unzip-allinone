@@ -438,6 +438,10 @@ func scanArchives(root string, depth int, includeHidden bool) ([]archiveInfo, er
 			if dirDepth(root, path) > depth {
 				return filepath.SkipDir
 			}
+			// Never descend into our own staging dirs (a crashed run may leave one).
+			if strings.HasPrefix(d.Name(), stagingPrefix) {
+				return filepath.SkipDir
+			}
 			if !includeHidden && strings.HasPrefix(d.Name(), ".") {
 				return filepath.SkipDir
 			}
@@ -597,7 +601,7 @@ func (a *app) runExtractJob(j *job, root string, req extractRequest) {
 		}
 		j.publish(startEvt)
 
-		if err := a.extractOne(j, base, info, password, req.ConflictPolicy); err != nil {
+		if _, err := a.extractOne(j, base, info, password, req.ConflictPolicy); err != nil {
 			if errors.Is(err, context.Canceled) {
 				j.publish(jobEvent{
 					Type:           "job",
@@ -620,6 +624,14 @@ func (a *app) runExtractJob(j *job, root string, req extractRequest) {
 
 		message := "解压完成"
 		if req.DeleteOriginal {
+			// Only delete the source after 7-Zip verifies the archive end to end.
+			// Extraction succeeding is not proof enough to discard the only copy.
+			if err := a.verifyArchive(j.ctx, info, password); err != nil {
+				successCount++
+				warningCount++
+				j.publish(withEvent(base, "warning", 100, "解压完成，但校验未通过，已保留原始压缩包: "+err.Error(), ""))
+				continue
+			}
 			deleted, err := deleteArchiveParts(info.Path)
 			if err != nil {
 				successCount++
@@ -635,7 +647,7 @@ func (a *app) runExtractJob(j *job, root string, req extractRequest) {
 	j.publish(jobEvent{
 		Type:           "job",
 		JobID:          j.id,
-		Status:         "done",
+		Status:         jobOutcome(successCount, failedCount, false),
 		Percent:        100,
 		Message:        buildJobSummary(total, successCount, failedCount, warningCount, false),
 		Total:          total,
@@ -647,10 +659,233 @@ func (a *app) runExtractJob(j *job, root string, req extractRequest) {
 	})
 }
 
-func (a *app) extractOne(j *job, base jobEvent, info archiveInfo, password, conflictPolicy string) error {
+// checkArchivePassword fails fast on a wrong password or an unreadable archive.
+// "l -slt" only reads the header, so this costs milliseconds even for multi-GB
+// archives and — unlike "x" — writes nothing to disk. Running it first means a
+// bad password never gets the chance to spill partial output.
+func (a *app) checkArchivePassword(ctx context.Context, info archiveInfo, password string) error {
+	cmd := exec.CommandContext(ctx, a.sevenZip, "l", "-slt", "-p"+password, info.Path)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return context.Canceled
+	}
+	if line := first7zProblemLine(string(out)); line != "" {
+		return errors.New(humanize7zLine(line))
+	}
+	return fmt.Errorf("无法读取压缩包：%s。常见原因：密码错误、分卷缺失或文件损坏", err)
+}
+
+// verifyArchive runs a full integrity test. Used before deleting originals.
+func (a *app) verifyArchive(ctx context.Context, info archiveInfo, password string) error {
+	cmd := exec.CommandContext(ctx, a.sevenZip, "t", "-p"+password, info.Path)
+	out, err := cmd.CombinedOutput()
+	if err == nil {
+		return nil
+	}
+	if ctx.Err() != nil {
+		return context.Canceled
+	}
+	if line := first7zProblemLine(string(out)); line != "" {
+		return errors.New(humanize7zLine(line))
+	}
+	return errors.New("完整性校验失败")
+}
+
+func first7zProblemLine(output string) string {
+	for _, raw := range strings.Split(output, "\n") {
+		line := strings.TrimSpace(raw)
+		if line == "" || strings.Contains(strings.ToLower(line), "everything is ok") {
+			continue
+		}
+		if shouldSurface7zLine(line) {
+			return line
+		}
+	}
+	return ""
+}
+
+// stagingPrefix marks temporary extraction directories. Scans skip these so a
+// crashed run's leftovers never show up as archives to extract.
+const stagingPrefix = ".unzip-allinone-tmp-"
+
+type commitStats struct {
+	Written  int
+	Skipped  int
+	Renamed  int
+	Replaced int
+}
+
+// commitStaged moves everything from staging into target, applying policy to
+// each conflicting file. Directories are merged rather than replaced so an
+// archive adding files to an existing folder does not wipe it.
+func commitStaged(staging, target, policy string) (commitStats, error) {
+	var stats commitStats
+	entries, err := os.ReadDir(staging)
+	if err != nil {
+		return stats, err
+	}
+	for _, entry := range entries {
+		if err := commitEntry(filepath.Join(staging, entry.Name()), filepath.Join(target, entry.Name()), policy, &stats); err != nil {
+			return stats, err
+		}
+	}
+	return stats, nil
+}
+
+func commitEntry(src, dst, policy string, stats *commitStats) error {
+	srcInfo, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	dstInfo, dstErr := os.Lstat(dst)
+	exists := dstErr == nil
+
+	// Merge directory into existing directory, recursing so the policy applies
+	// per file rather than to the whole tree.
+	if exists && srcInfo.IsDir() && dstInfo.IsDir() {
+		children, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			if err := commitEntry(filepath.Join(src, child.Name()), filepath.Join(dst, child.Name()), policy, stats); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+
+	if exists {
+		switch policy {
+		case "skip":
+			stats.Skipped++
+			return nil
+		case "rename":
+			unique, err := uniquePath(dst)
+			if err != nil {
+				return err
+			}
+			dst = unique
+			stats.Renamed++
+		default: // overwrite
+			if err := os.RemoveAll(dst); err != nil {
+				return err
+			}
+			stats.Replaced++
+		}
+	} else {
+		stats.Written++
+	}
+
+	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
+		return err
+	}
+	if err := os.Rename(src, dst); err != nil {
+		// Rename fails across filesystems; fall back to a copy.
+		if copyErr := copyPath(src, dst); copyErr != nil {
+			return copyErr
+		}
+	}
+	return nil
+}
+
+// uniquePath returns dst with " (2)", " (3)", … inserted before the extension
+// until the name is free, matching how desktop file managers de-duplicate.
+func uniquePath(dst string) (string, error) {
+	ext := filepath.Ext(dst)
+	stem := strings.TrimSuffix(dst, ext)
+	for i := 2; i < 10000; i++ {
+		candidate := fmt.Sprintf("%s (%d)%s", stem, i, ext)
+		if _, err := os.Lstat(candidate); os.IsNotExist(err) {
+			return candidate, nil
+		}
+	}
+	return "", fmt.Errorf("无法为 %s 生成不重复的文件名", filepath.Base(dst))
+}
+
+func copyPath(src, dst string) error {
+	info, err := os.Lstat(src)
+	if err != nil {
+		return err
+	}
+	if info.IsDir() {
+		if err := os.MkdirAll(dst, info.Mode().Perm()); err != nil {
+			return err
+		}
+		children, err := os.ReadDir(src)
+		if err != nil {
+			return err
+		}
+		for _, child := range children {
+			if err := copyPath(filepath.Join(src, child.Name()), filepath.Join(dst, child.Name())); err != nil {
+				return err
+			}
+		}
+		return nil
+	}
+	if info.Mode()&os.ModeSymlink != 0 {
+		linkTarget, err := os.Readlink(src)
+		if err != nil {
+			return err
+		}
+		return os.Symlink(linkTarget, dst)
+	}
+	in, err := os.Open(src)
+	if err != nil {
+		return err
+	}
+	defer in.Close()
+	out, err := os.OpenFile(dst, os.O_WRONLY|os.O_CREATE|os.O_TRUNC, info.Mode().Perm())
+	if err != nil {
+		return err
+	}
+	if _, err := io.Copy(out, in); err != nil {
+		out.Close()
+		return err
+	}
+	return out.Close()
+}
+
+// extractOne unpacks one archive into a staging directory and only then commits
+// the result into the target directory.
+//
+// Staging is what makes extraction safe. 7-Zip writes decoded bytes to disk
+// *before* it discovers a wrong password or a CRC failure, so extracting
+// straight into the target left full-size garbage files behind on failure. With
+// the default "skip existing" policy a later retry with the correct password
+// then skipped that garbage and the job still reported success — silent
+// corruption, and unrecoverable once "delete original" was on. Staging also
+// means a cancelled job leaves nothing behind.
+func (a *app) extractOne(j *job, base jobEvent, info archiveInfo, password, conflictPolicy string) (commitStats, error) {
+	// Fail before creating anything if the password is wrong or the archive is broken.
+	if err := a.checkArchivePassword(j.ctx, info, password); err != nil {
+		return commitStats{}, err
+	}
+
+	staging, err := os.MkdirTemp(info.Directory, stagingPrefix+"*")
+	if err != nil {
+		return commitStats{}, fmt.Errorf("无法创建临时解压目录: %w", err)
+	}
+	// Always clear staging: on success commitStaged has already moved everything
+	// out, on any failure or cancellation this is what discards the garbage.
+	defer os.RemoveAll(staging)
+
+	if err := a.run7z(j, base, info, password, staging); err != nil {
+		return commitStats{}, err
+	}
+	return commitStaged(staging, info.Directory, conflictPolicy)
+}
+
+func (a *app) run7z(j *job, base jobEvent, info archiveInfo, password, outDir string) error {
 	// -bsp1: progress on stdout; -bso1/-bse1: messages on stdout/stderr.
 	// p7zip refreshes progress with backspace (\x08), not only \r — see scan7zOutput.
-	args := []string{"x", "-y", "-bsp1", "-bso1", "-bse1", conflictPolicyArg(conflictPolicy), "-p" + password, "-o" + info.Directory, info.Path}
+	// -aoa is safe here because outDir is a freshly created empty staging dir;
+	// the user's conflict policy is applied later by commitStaged.
+	// -p is passed via argv only as a fallback; see passwordStdin below.
+	args := []string{"x", "-y", "-bsp1", "-bso1", "-bse1", "-aoa", "-p" + password, "-o" + outDir, info.Path}
 	cmd := exec.CommandContext(j.ctx, a.sevenZip, args...)
 
 	stdout, err := cmd.StdoutPipe()
@@ -893,14 +1128,40 @@ func deleteArchiveParts(firstPart string) (int, error) {
 	return len(parts), nil
 }
 
+// jobOutcome classifies a finished job so the UI can show success, partial
+// failure, and total failure differently. Reporting "处理完成" with a green check
+// when every archive failed hid real errors from users.
+func jobOutcome(successCount, failedCount int, cancelled bool) string {
+	switch {
+	case cancelled:
+		return "cancelled"
+	case failedCount == 0:
+		return "done"
+	case successCount == 0:
+		return "failed"
+	default:
+		return "partial"
+	}
+}
+
 func buildJobSummary(total, successCount, failedCount, warningCount int, cancelled bool) string {
-	status := "处理完成"
-	if cancelled {
+	var status string
+	switch jobOutcome(successCount, failedCount, cancelled) {
+	case "cancelled":
 		status = "任务已取消"
+	case "failed":
+		status = "全部失败"
+	case "partial":
+		status = "部分完成"
+	default:
+		status = "全部成功"
 	}
 	summary := fmt.Sprintf("%s：%d 个文件中 %d 成功，%d 失败", status, total, successCount, failedCount)
 	if warningCount > 0 {
 		summary += fmt.Sprintf("，%d 个告警", warningCount)
+	}
+	if failedCount > 0 {
+		return summary + "。失败项可修改密码后重试。"
 	}
 	return summary + "。输出位置为每个压缩包所在目录。"
 }
@@ -1280,17 +1541,6 @@ func normalizeConflictPolicy(policy string) (string, error) {
 		return "rename", nil
 	default:
 		return "", errors.New("invalid conflict policy")
-	}
-}
-
-func conflictPolicyArg(policy string) string {
-	switch policy {
-	case "overwrite":
-		return "-aoa"
-	case "rename":
-		return "-aou"
-	default:
-		return "-aos"
 	}
 }
 

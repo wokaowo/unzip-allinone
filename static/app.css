@@ -1796,6 +1796,18 @@ body.is-extracting .action-dock {
   background: linear-gradient(180deg, var(--green-soft), var(--bg-solid) 50%);
 }
 
+/* Partial failure — amber, distinct from both success and total failure. */
+.job-result.partial {
+  border-color: color-mix(in srgb, var(--amber) 40%, var(--line));
+  background: linear-gradient(180deg, var(--amber-soft), var(--bg-solid) 50%);
+}
+
+/* Every archive failed — must never read as success. */
+.job-result.failed {
+  border-color: color-mix(in srgb, var(--red) 42%, var(--line));
+  background: linear-gradient(180deg, var(--red-soft), var(--bg-solid) 50%);
+}
+
 .job-result.cancelled {
   border-color: color-mix(in srgb, var(--amber) 35%, var(--line));
   background: linear-gradient(180deg, var(--amber-soft), var(--bg-solid) 50%);
@@ -1826,6 +1838,16 @@ body.is-extracting .action-dock {
 .job-result.cancelled .result-icon {
   background: var(--amber-soft);
   color: var(--amber-text);
+}
+
+.job-result.partial .result-icon {
+  background: var(--amber-soft);
+  color: var(--amber-text);
+}
+
+.job-result.failed .result-icon {
+  background: var(--red-soft);
+  color: var(--red-text);
 }
 
 .job-result h3,
@@ -1863,6 +1885,7 @@ body.is-extracting .action-dock {
 
 .result-metric.ok { color: var(--green-text); background: var(--green-soft); border-color: transparent; }
 .result-metric.bad { color: var(--red-text); background: var(--red-soft); border-color: transparent; }
+.result-metric.warn { color: var(--amber-text); background: var(--amber-soft); border-color: transparent; }
 
 .retry-panel {
   border-color: color-mix(in srgb, var(--red) 28%, var(--line));

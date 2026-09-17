@@ -1,6 +1,7 @@
 package main
 
 import (
+	"context"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -152,7 +153,7 @@ func TestExtractOneWith7zaVolume(t *testing.T) {
 	}
 	j := newJob()
 	a := &app{sevenZip: sevenZip, jobs: &jobStore{jobs: map[string]*job{}}}
-	if err := a.extractOne(j, jobEvent{Type: "archive", JobID: j.id, ArchiveID: info.ID}, info, info.DefaultPassword, "overwrite"); err != nil {
+	if _, err := a.extractOne(j, jobEvent{Type: "archive", JobID: j.id, ArchiveID: info.ID}, info, info.DefaultPassword, "overwrite"); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(source); err != nil {
@@ -313,5 +314,247 @@ func TestJobSnapshotSurvivesProgressFlood(t *testing.T) {
 	}
 	if !foundDone {
 		t.Fatalf("expected done archive in history: %#v", history)
+	}
+}
+
+// makeEncrypted7z builds an encrypted archive containing one file with the given
+// content and returns the archive path plus the path the content extracts to.
+func makeEncrypted7z(t *testing.T, root, dirName, password, content string) (archivePath, extractedPath string) {
+	t.Helper()
+	sevenZip, err := find7za()
+	if err != nil {
+		t.Skip(err)
+	}
+	dir := filepath.Join(root, dirName)
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	payload := filepath.Join(dir, "payload.txt")
+	if err := os.WriteFile(payload, []byte(content), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archivePath = filepath.Join(dir, "data.7z")
+	cmd := exec.Command(sevenZip, "a", "-t7z", "-p"+password, archivePath, payload)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create archive: %v\n%s", err, out)
+	}
+	if err := os.Remove(payload); err != nil {
+		t.Fatal(err)
+	}
+	return archivePath, payload
+}
+
+func newTestApp(t *testing.T) *app {
+	t.Helper()
+	sevenZip, err := find7za()
+	if err != nil {
+		t.Skip(err)
+	}
+	return &app{sevenZip: sevenZip, jobs: &jobStore{jobs: map[string]*job{}}}
+}
+
+// A wrong password must fail without writing anything into the target dir.
+// Previously 7-Zip wrote full-size garbage before reporting the failure.
+func TestExtractOneWrongPasswordLeavesNoPartialFiles(t *testing.T) {
+	root := t.TempDir()
+	archive, extracted := makeEncrypted7z(t, root, "alpha", "RIGHTPW", "the real content")
+
+	a := newTestApp(t)
+	info, err := buildArchiveInfo(root, archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := newJob()
+	if _, err := a.extractOne(j, jobEvent{Type: "archive", ArchiveID: info.ID}, info, "WRONGPW", "skip"); err == nil {
+		t.Fatal("expected wrong password to fail")
+	}
+	if _, err := os.Stat(extracted); !os.IsNotExist(err) {
+		t.Fatalf("wrong password left a partial file behind at %s", extracted)
+	}
+	entries, err := os.ReadDir(filepath.Dir(archive))
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, entry := range entries {
+		if entry.Name() != filepath.Base(archive) {
+			t.Fatalf("unexpected leftover in target dir: %s", entry.Name())
+		}
+	}
+}
+
+// The core corruption regression: a failed attempt must not poison a later retry.
+// Before staging, the failed run left garbage that "skip existing" preserved,
+// and the retry then reported success over corrupt data.
+func TestRetryAfterWrongPasswordYieldsCorrectContent(t *testing.T) {
+	root := t.TempDir()
+	const want = "the real content"
+	archive, extracted := makeEncrypted7z(t, root, "alpha", "RIGHTPW", want)
+
+	a := newTestApp(t)
+	info, err := buildArchiveInfo(root, archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.extractOne(newJob(), jobEvent{}, info, "WRONGPW", "skip"); err == nil {
+		t.Fatal("expected first attempt to fail")
+	}
+	if _, err := a.extractOne(newJob(), jobEvent{}, info, "RIGHTPW", "skip"); err != nil {
+		t.Fatalf("retry with correct password failed: %v", err)
+	}
+	got, err := os.ReadFile(extracted)
+	if err != nil {
+		t.Fatalf("expected extracted file after retry: %v", err)
+	}
+	if string(got) != want {
+		t.Fatalf("retry produced corrupt content: got %q, want %q", got, want)
+	}
+}
+
+func TestCommitStagedAppliesConflictPolicy(t *testing.T) {
+	for _, tc := range []struct {
+		policy      string
+		wantContent string
+		wantRenamed bool
+	}{
+		{"skip", "existing", false},
+		{"overwrite", "fresh", false},
+		{"rename", "existing", true},
+	} {
+		t.Run(tc.policy, func(t *testing.T) {
+			base := t.TempDir()
+			staging := filepath.Join(base, "staging")
+			target := filepath.Join(base, "target")
+			for _, dir := range []string{staging, target} {
+				if err := os.MkdirAll(dir, 0o755); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if err := os.WriteFile(filepath.Join(target, "f.txt"), []byte("existing"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.WriteFile(filepath.Join(staging, "f.txt"), []byte("fresh"), 0o644); err != nil {
+				t.Fatal(err)
+			}
+
+			if _, err := commitStaged(staging, target, tc.policy); err != nil {
+				t.Fatal(err)
+			}
+			got, err := os.ReadFile(filepath.Join(target, "f.txt"))
+			if err != nil {
+				t.Fatal(err)
+			}
+			if string(got) != tc.wantContent {
+				t.Fatalf("policy %q: f.txt = %q, want %q", tc.policy, got, tc.wantContent)
+			}
+			_, err = os.Stat(filepath.Join(target, "f (2).txt"))
+			if tc.wantRenamed && err != nil {
+				t.Fatalf("policy rename: expected 'f (2).txt' to exist: %v", err)
+			}
+			if !tc.wantRenamed && err == nil {
+				t.Fatalf("policy %q: unexpected renamed copy created", tc.policy)
+			}
+		})
+	}
+}
+
+// Committing must merge into an existing directory, not replace it.
+func TestCommitStagedMergesDirectories(t *testing.T) {
+	base := t.TempDir()
+	staging := filepath.Join(base, "staging", "shared")
+	target := filepath.Join(base, "target", "shared")
+	for _, dir := range []string{staging, target} {
+		if err := os.MkdirAll(dir, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	if err := os.WriteFile(filepath.Join(target, "keep.txt"), []byte("keep"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "add.txt"), []byte("add"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := commitStaged(filepath.Join(base, "staging"), filepath.Join(base, "target"), "skip"); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"keep.txt", "add.txt"} {
+		if _, err := os.Stat(filepath.Join(target, name)); err != nil {
+			t.Fatalf("expected %s to survive the merge: %v", name, err)
+		}
+	}
+}
+
+// A wrong password must never delete the original archive.
+func TestVerifyArchiveGuardsOriginalDeletion(t *testing.T) {
+	root := t.TempDir()
+	archive, _ := makeEncrypted7z(t, root, "alpha", "RIGHTPW", "content")
+	a := newTestApp(t)
+	info, err := buildArchiveInfo(root, archive)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.verifyArchive(context.Background(), info, "WRONGPW"); err == nil {
+		t.Fatal("expected verifyArchive to reject a wrong password")
+	}
+	if err := a.verifyArchive(context.Background(), info, "RIGHTPW"); err != nil {
+		t.Fatalf("expected verifyArchive to accept the correct password: %v", err)
+	}
+}
+
+func TestScanArchivesSkipsStagingDirs(t *testing.T) {
+	root := t.TempDir()
+	staging := filepath.Join(root, stagingPrefix+"abc123")
+	if err := os.MkdirAll(staging, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(staging, "leftover.zip"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	archives, err := scanArchives(root, defaultScanDepth, true)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 0 {
+		t.Fatalf("staging leftovers must not be scanned, got %#v", archives)
+	}
+}
+
+func TestJobOutcomeClassification(t *testing.T) {
+	tests := []struct {
+		name            string
+		success, failed int
+		cancelled       bool
+		want            string
+	}{
+		{"all succeeded", 3, 0, false, "done"},
+		{"all failed", 0, 3, false, "failed"},
+		{"partially failed", 2, 1, false, "partial"},
+		{"cancelled wins", 1, 1, true, "cancelled"},
+		{"nothing processed", 0, 0, false, "done"},
+	}
+	for _, tc := range tests {
+		t.Run(tc.name, func(t *testing.T) {
+			if got := jobOutcome(tc.success, tc.failed, tc.cancelled); got != tc.want {
+				t.Fatalf("jobOutcome(%d, %d, %v) = %q, want %q", tc.success, tc.failed, tc.cancelled, got, tc.want)
+			}
+		})
+	}
+}
+
+// An all-failed job must not be described as success.
+func TestBuildJobSummaryDistinguishesFailure(t *testing.T) {
+	allFailed := buildJobSummary(3, 0, 3, 0, false)
+	if !strings.Contains(allFailed, "全部失败") {
+		t.Fatalf("all-failed summary should say 全部失败, got %q", allFailed)
+	}
+	if strings.Contains(allFailed, "全部成功") {
+		t.Fatalf("all-failed summary must not claim success: %q", allFailed)
+	}
+	partial := buildJobSummary(3, 2, 1, 0, false)
+	if !strings.Contains(partial, "部分完成") {
+		t.Fatalf("partial summary should say 部分完成, got %q", partial)
+	}
+	success := buildJobSummary(3, 3, 0, 0, false)
+	if !strings.Contains(success, "全部成功") {
+		t.Fatalf("success summary should say 全部成功, got %q", success)
 	}
 }
