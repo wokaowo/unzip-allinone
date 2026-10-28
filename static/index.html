@@ -184,6 +184,46 @@
           </div>
         </div>
 
+        <div class="progress-panel" id="progressPanel" hidden>
+          <div class="progress-head">
+            <div class="progress-copy">
+              <div class="progress-kicker-row">
+                <p class="panel-kicker">进度</p>
+                <span class="live-dot" id="liveDot" hidden aria-hidden="true"></span>
+              </div>
+              <h2 id="progressTitle">实时状态</h2>
+              <p class="subtitle" id="jobSummary">正在准备</p>
+              <p class="now-line" id="nowLine" hidden></p>
+              <p class="progress-meta" id="progressMeta" hidden>
+                <span id="progressCounts">0 / 0</span>
+                <span class="meta-dot" aria-hidden="true">·</span>
+                <span id="progressElapsed">00:00</span>
+                <span class="meta-dot" aria-hidden="true">·</span>
+                <span id="progressEta">预计剩余 —</span>
+              </p>
+            </div>
+            <div class="progress-head-actions">
+              <div class="overall-ring" id="overallRing" aria-hidden="true">
+                <svg viewBox="0 0 44 44" width="44" height="44">
+                  <circle class="ring-track" cx="22" cy="22" r="18" fill="none" stroke-width="3.5"/>
+                  <circle class="ring-value" id="overallRingValue" cx="22" cy="22" r="18" fill="none" stroke-width="3.5"
+                    stroke-linecap="round" transform="rotate(-90 22 22)"
+                    stroke-dasharray="113.1" stroke-dashoffset="113.1"/>
+                </svg>
+                <span class="overall-percent" id="overallPercent">0%</span>
+              </div>
+              <button id="cancelButton" class="btn btn-secondary" type="button">取消</button>
+            </div>
+          </div>
+          <div class="overall-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="overallBarHost">
+            <span id="overallBar"></span>
+          </div>
+          <details class="event-disclosure" id="eventDisclosure">
+            <summary>详细日志 <em id="eventCount"></em></summary>
+            <div class="event-log" id="eventLog" aria-live="off"></div>
+          </details>
+        </div>
+
         <div class="list-surface">
           <div class="result-list" id="resultList">
             <div class="empty-state" id="emptyState">
@@ -195,7 +235,7 @@
                 </svg>
               </div>
               <h3>准备开始</h3>
-              <p>在左侧进入存放压缩包的文件夹，点击「扫描此文件夹」。支持 zip、7z 与分卷。</p>
+              <p>在左侧进入存放压缩包的文件夹，点击「扫描此文件夹」。支持 zip、7z、wim/esd 与分卷。</p>
               <ol class="empty-steps">
                 <li>选择目录</li>
                 <li>扫描并确认列表</li>
@@ -221,7 +261,7 @@
             </label>
             <label class="switch-row danger">
               <span>
-                解压成功后删除原始分卷
+                解压成功后删除原始压缩包（含分卷）
                 <small>高风险，默认关闭</small>
               </span>
               <input type="checkbox" id="deleteOriginal" class="switch-input">
@@ -233,49 +273,22 @@
 
         <div class="job-result" id="jobResult" hidden></div>
         <div class="retry-panel" id="retryPanel" hidden></div>
-
-        <div class="progress-panel" id="progressPanel" hidden>
-          <div class="progress-head">
-            <div>
-              <p class="panel-kicker">进度</p>
-              <h2>实时状态</h2>
-              <p class="subtitle" id="jobSummary">正在准备</p>
-              <p class="progress-meta" id="progressMeta" hidden>
-                <span id="progressCounts">0 / 0</span>
-                <span class="meta-dot" aria-hidden="true">·</span>
-                <span id="progressElapsed">00:00</span>
-              </p>
-            </div>
-            <div class="progress-head-actions">
-              <div class="overall-ring" id="overallRing" aria-hidden="true">
-                <svg viewBox="0 0 44 44" width="44" height="44">
-                  <circle class="ring-track" cx="22" cy="22" r="18" fill="none" stroke-width="3.5"/>
-                  <circle class="ring-value" id="overallRingValue" cx="22" cy="22" r="18" fill="none" stroke-width="3.5"
-                    stroke-linecap="round" transform="rotate(-90 22 22)"
-                    stroke-dasharray="113.1" stroke-dashoffset="113.1"/>
-                </svg>
-                <span class="overall-percent" id="overallPercent">0%</span>
-              </div>
-              <button id="cancelButton" class="btn btn-secondary" type="button">取消</button>
-            </div>
-          </div>
-          <div class="overall-bar" role="progressbar" aria-valuemin="0" aria-valuemax="100" aria-valuenow="0" id="overallBarHost">
-            <span id="overallBar"></span>
-          </div>
-          <div class="event-log" id="eventLog" aria-live="polite"></div>
-        </div>
       </section>
     </section>
   </main>
 
   <div class="action-dock" id="actionDock" hidden>
     <div class="action-dock-inner">
+      <div class="dock-progress" id="dockProgress" hidden>
+        <span id="dockProgressBar"></span>
+      </div>
       <div class="action-dock-meta">
         <strong id="dockCount">已选 0 项</strong>
         <span id="dockHint">准备就绪，可开始解压</span>
       </div>
       <div class="action-dock-actions">
         <button type="button" class="btn btn-secondary" id="dockSelectAll">全选</button>
+        <button type="button" class="btn btn-secondary" id="dockCancel" hidden>取消</button>
         <button type="button" class="btn btn-primary" id="dockExtract">
           <span class="btn-label">开始解压</span>
           <span class="btn-spinner" aria-hidden="true"></span>

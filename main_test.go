@@ -2,6 +2,8 @@ package main
 
 import (
 	"context"
+	"errors"
+	"fmt"
 	"os"
 	"os/exec"
 	"path/filepath"
@@ -153,7 +155,7 @@ func TestExtractOneWith7zaVolume(t *testing.T) {
 	}
 	j := newJob()
 	a := &app{sevenZip: sevenZip, jobs: &jobStore{jobs: map[string]*job{}}}
-	if _, err := a.extractOne(j, jobEvent{Type: "archive", JobID: j.id, ArchiveID: info.ID}, info, info.DefaultPassword, "overwrite"); err != nil {
+	if _, err := a.extractOne(j, jobEvent{Type: "archive", JobID: j.id, ArchiveID: info.ID}, info, info.DefaultPassword, "overwrite", false); err != nil {
 		t.Fatal(err)
 	}
 	if _, err := os.Stat(source); err != nil {
@@ -186,6 +188,9 @@ func TestArchiveFormat(t *testing.T) {
 	tests := map[string]string{
 		"/tmp/demo.zip":    "zip",
 		"/tmp/demo.7z":     "7z",
+		"/tmp/demo.wim":    "wim",
+		"/tmp/demo.esd":    "esd",
+		"/tmp/demo.swm":    "swm",
 		"/tmp/demo.7z.001": "7z",
 		"/tmp/001":         "split",
 	}
@@ -193,6 +198,194 @@ func TestArchiveFormat(t *testing.T) {
 		if got := archiveFormat(input); got != want {
 			t.Fatalf("archiveFormat(%q) = %q, want %q", input, got, want)
 		}
+	}
+}
+
+func TestScanArchivesSupportsWim(t *testing.T) {
+	root := t.TempDir()
+	dir := filepath.Join(root, "alpha")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"install.wim", "image.esd", "install.swm"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("image"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+		if !isSupportedArchive(filepath.Join(dir, name)) {
+			t.Fatalf("%s must be a supported archive", name)
+		}
+	}
+
+	archives, err := scanArchives(root, defaultScanDepth, false)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(archives) != 3 {
+		t.Fatalf("expected three image archives, got %#v", archives)
+	}
+	formats := map[string]bool{}
+	for _, archive := range archives {
+		formats[archive.Format] = true
+	}
+	for _, format := range []string{"wim", "esd", "swm"} {
+		if !formats[format] {
+			t.Fatalf("expected format %q, got %#v", format, formats)
+		}
+	}
+}
+
+func TestFindSplitArchives(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"inner.7z.001", "inner.7z.002", "skip.txt"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	sub := filepath.Join(dir, "nested")
+	if err := os.MkdirAll(sub, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	for _, name := range []string{"001", "002"} {
+		if err := os.WriteFile(filepath.Join(sub, name), []byte(name), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	got := findSplitArchives(dir)
+	if len(got) != 2 {
+		t.Fatalf("expected 2 split sets, got %#v", got)
+	}
+}
+
+// A container archive whose payload is a 001/002 split set must be expanded in
+// the same task, not left for a second scan.
+func TestExtractOneExpandsNestedSplitArchive(t *testing.T) {
+	sevenZip, err := find7za()
+	if err != nil {
+		t.Skip(err)
+	}
+
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	const want = "nested payload content that is long enough to span volumes"
+	payload := filepath.Join(work, "payload.txt")
+	if err := os.WriteFile(payload, []byte(strings.Repeat(want+"\n", 200)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	inner := filepath.Join(work, "inner.7z")
+	cmd := exec.Command(sevenZip, "a", "-t7z", "-mx0", "-v1k", "-palpha", inner, payload)
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("create inner archive: %v\n%s", err, out)
+	}
+	if err := os.Remove(payload); err != nil {
+		t.Fatal(err)
+	}
+	parts, _ := filepath.Glob(inner + ".0*")
+	if len(parts) < 2 {
+		t.Fatalf("expected a multi-volume inner archive, got %#v", parts)
+	}
+
+	outer := filepath.Join(work, "outer.7z")
+	args := append([]string{"a", "-t7z", outer}, parts...)
+	if out, err := exec.Command(sevenZip, args...).CombinedOutput(); err != nil {
+		t.Fatalf("create outer archive: %v\n%s", err, out)
+	}
+	for _, part := range parts {
+		if err := os.Remove(part); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a := newTestApp(t)
+	info, err := buildArchiveInfo(work, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.extractOne(newJob(), jobEvent{}, info, "alpha", "overwrite", false); err != nil {
+		t.Fatalf("extractOne failed: %v", err)
+	}
+
+	extracted := filepath.Join(work, "payload.txt")
+	got, err := os.ReadFile(extracted)
+	if err != nil {
+		t.Fatalf("nested payload was not expanded: %v", err)
+	}
+	if !strings.Contains(string(got), want) {
+		t.Fatalf("nested payload content mismatch")
+	}
+}
+
+// Plain "001"/"002" volumes (no format extension) must be expanded too — this is
+// the exact naming a WIM payload often uses.
+func TestExtractOneExpandsPlainNumberedVolumes(t *testing.T) {
+	sevenZip, err := find7za()
+	if err != nil {
+		t.Skip(err)
+	}
+
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := filepath.Join(work, "payload.txt")
+	if err := os.WriteFile(payload, []byte(strings.Repeat("plain volume data\n", 200)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inner := filepath.Join(work, "inner.7z")
+	if out, err := exec.Command(sevenZip, "a", "-t7z", "-mx0", "-v1k", inner, payload).CombinedOutput(); err != nil {
+		t.Fatalf("create inner archive: %v\n%s", err, out)
+	}
+	if err := os.Remove(payload); err != nil {
+		t.Fatal(err)
+	}
+
+	// Rename inner.7z.001/002/... to plain 001/002/... before packing into outer.
+	parts, _ := filepath.Glob(inner + ".0*")
+	if len(parts) < 2 {
+		t.Fatalf("expected multi-volume archive, got %#v", parts)
+	}
+	plain := make([]string, 0, len(parts))
+	for i, part := range parts {
+		plainName := filepath.Join(work, fmt.Sprintf("%03d", i+1))
+		if err := os.Rename(part, plainName); err != nil {
+			t.Fatal(err)
+		}
+		plain = append(plain, plainName)
+	}
+
+	outer := filepath.Join(work, "outer.7z")
+	args := append([]string{"a", "-t7z", outer}, plain...)
+	if out, err := exec.Command(sevenZip, args...).CombinedOutput(); err != nil {
+		t.Fatalf("create outer archive: %v\n%s", err, out)
+	}
+	for _, part := range plain {
+		if err := os.Remove(part); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a := newTestApp(t)
+	info, err := buildArchiveInfo(work, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := a.extractOne(newJob(), jobEvent{}, info, "", "overwrite", false); err != nil {
+		t.Fatalf("extractOne failed: %v", err)
+	}
+
+	got, err := os.ReadFile(filepath.Join(work, "payload.txt"))
+	if err != nil {
+		t.Fatalf("plain numbered payload was not expanded: %v", err)
+	}
+	if !strings.Contains(string(got), "plain volume data") {
+		t.Fatalf("plain numbered payload content mismatch")
 	}
 }
 
@@ -365,7 +558,7 @@ func TestExtractOneWrongPasswordLeavesNoPartialFiles(t *testing.T) {
 		t.Fatal(err)
 	}
 	j := newJob()
-	if _, err := a.extractOne(j, jobEvent{Type: "archive", ArchiveID: info.ID}, info, "WRONGPW", "skip"); err == nil {
+	if _, err := a.extractOne(j, jobEvent{Type: "archive", ArchiveID: info.ID}, info, "WRONGPW", "skip", false); err == nil {
 		t.Fatal("expected wrong password to fail")
 	}
 	if _, err := os.Stat(extracted); !os.IsNotExist(err) {
@@ -395,10 +588,10 @@ func TestRetryAfterWrongPasswordYieldsCorrectContent(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if _, err := a.extractOne(newJob(), jobEvent{}, info, "WRONGPW", "skip"); err == nil {
+	if _, err := a.extractOne(newJob(), jobEvent{}, info, "WRONGPW", "skip", false); err == nil {
 		t.Fatal("expected first attempt to fail")
 	}
-	if _, err := a.extractOne(newJob(), jobEvent{}, info, "RIGHTPW", "skip"); err != nil {
+	if _, err := a.extractOne(newJob(), jobEvent{}, info, "RIGHTPW", "skip", false); err != nil {
 		t.Fatalf("retry with correct password failed: %v", err)
 	}
 	got, err := os.ReadFile(extracted)
@@ -556,5 +749,259 @@ func TestBuildJobSummaryDistinguishesFailure(t *testing.T) {
 	success := buildJobSummary(3, 3, 0, 0, false)
 	if !strings.Contains(success, "全部成功") {
 		t.Fatalf("success summary should say 全部成功, got %q", success)
+	}
+}
+
+func TestParseArchiveListingDetectsSplitParts(t *testing.T) {
+	out := `Path = /tmp/pack.wim
+Type = wim
+Physical Size = 4096
+
+----------
+
+Path = payload.7z.001
+Size = 1000
+Attributes = A
+Folder = -
+
+Path = payload.7z.002
+Size = 2000
+Attributes = A
+Folder = -
+
+Path = docs
+Attributes = D
+Folder = +
+
+Path = readme.txt
+Size = 12
+Attributes = A
+Folder = -
+`
+	listing := parseArchiveListing(out)
+	if !listing.HasNested {
+		t.Fatal("expected nested split set to be detected")
+	}
+	if listing.NestedBytes != 3000 {
+		t.Fatalf("NestedBytes = %d, want 3000", listing.NestedBytes)
+	}
+}
+
+func TestParseArchiveListingPlainNumberedVolumes(t *testing.T) {
+	out := `Path = /tmp/pack.zip
+Type = zip
+Physical Size = 100
+
+----------
+
+Path = 001
+Size = 500
+Attributes = A
+Folder = -
+
+Path = 002
+Size = 700
+Attributes = A
+Folder = -
+
+Path = notes.txt
+Size = 3
+Attributes = A
+Folder = -
+`
+	listing := parseArchiveListing(out)
+	if !listing.HasNested {
+		t.Fatal("expected plain numbered volumes to be detected")
+	}
+	if listing.NestedBytes != 1200 {
+		t.Fatalf("NestedBytes = %d, want 1200", listing.NestedBytes)
+	}
+}
+
+func TestParseArchiveListingWithoutVolumes(t *testing.T) {
+	out := `Path = /tmp/plain.7z
+Type = 7z
+Physical Size = 100
+
+----------
+
+Path = file.txt
+Size = 20
+Attributes = A
+Folder = -
+`
+	listing := parseArchiveListing(out)
+	if listing.HasNested || listing.NestedBytes != 0 {
+		t.Fatalf("expected no nested volumes, got %#v", listing)
+	}
+}
+
+func TestPhaseBoundary(t *testing.T) {
+	// No nested payload: the outer archive owns the whole bar.
+	if got := phaseBoundary(1000, 0); got != 100 {
+		t.Fatalf("phaseBoundary(1000, 0) = %d, want 100", got)
+	}
+	// Half and half split by bytes, clamped into a visible range.
+	if got := phaseBoundary(1000, 1000); got != 50 {
+		t.Fatalf("phaseBoundary(1000, 1000) = %d, want 50", got)
+	}
+	// A tiny outer with a huge payload still leaves room to see the first phase.
+	if got := phaseBoundary(1, 100000); got != 10 {
+		t.Fatalf("phaseBoundary(1, 100000) = %d, want clamped 10", got)
+	}
+}
+
+// The nested tracker must keep the outer archive's bar advancing after the first
+// phase, never jumping backwards or past 100.
+func TestNestedTrackerProgressIsMonotonic(t *testing.T) {
+	j := newJob()
+	var percents []int
+	// Capture published events via a subscriber.
+	ch := make(chan jobEvent, 512)
+	j.mu.Lock()
+	j.subs[ch] = struct{}{}
+	j.mu.Unlock()
+
+	tracker := &nestedTracker{j: j, base: jobEvent{Type: "archive", ArchiveID: "outer"}, start: 60, end: 100}
+	tracker.addBytes(1000)
+	tracker.addBytes(1000)
+	tracker.beginSet(1000)
+	for _, p := range []int{0, 50, 100} {
+		tracker.progress(p, "")
+	}
+	tracker.completeSet()
+	tracker.beginSet(1000)
+	for _, p := range []int{0, 50, 100} {
+		tracker.progress(p, "")
+	}
+	tracker.completeSet()
+	tracker.finish()
+
+	close(ch)
+	for evt := range ch {
+		percents = append(percents, evt.Percent)
+	}
+	if len(percents) == 0 {
+		t.Fatal("expected progress events")
+	}
+	prev := -1
+	for _, p := range percents {
+		if p < prev {
+			t.Fatalf("percent went backwards: %v", percents)
+		}
+		if p > 100 {
+			t.Fatalf("percent exceeded 100: %v", percents)
+		}
+		prev = p
+	}
+	if percents[len(percents)-1] != 100 {
+		t.Fatalf("expected final percent 100, got %v", percents)
+	}
+}
+
+// extractOne must advertise both phases when a container holds a split set, and
+// the reported bar must climb monotonically from 0 to 100 across them.
+func TestExtractOnePublishesTwoPhaseProgress(t *testing.T) {
+	sevenZip, err := find7za()
+	if err != nil {
+		t.Skip(err)
+	}
+
+	root := t.TempDir()
+	work := filepath.Join(root, "work")
+	if err := os.MkdirAll(work, 0o755); err != nil {
+		t.Fatal(err)
+	}
+
+	payload := filepath.Join(work, "payload.txt")
+	if err := os.WriteFile(payload, []byte(strings.Repeat("nested two-phase data\n", 400)), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	inner := filepath.Join(work, "inner.7z")
+	if out, err := exec.Command(sevenZip, "a", "-t7z", "-mx0", "-v1k", "-palpha", inner, payload).CombinedOutput(); err != nil {
+		t.Fatalf("create inner archive: %v\n%s", err, out)
+	}
+	if err := os.Remove(payload); err != nil {
+		t.Fatal(err)
+	}
+	parts, _ := filepath.Glob(inner + ".0*")
+	if len(parts) < 2 {
+		t.Fatalf("expected multi-volume archive, got %#v", parts)
+	}
+	outer := filepath.Join(work, "outer.7z")
+	args := append([]string{"a", "-t7z", outer}, parts...)
+	if out, err := exec.Command(sevenZip, args...).CombinedOutput(); err != nil {
+		t.Fatalf("create outer archive: %v\n%s", err, out)
+	}
+	for _, part := range parts {
+		if err := os.Remove(part); err != nil {
+			t.Fatal(err)
+		}
+	}
+
+	a := newTestApp(t)
+	info, err := buildArchiveInfo(work, outer)
+	if err != nil {
+		t.Fatal(err)
+	}
+	j := newJob()
+	ch := make(chan jobEvent, 4096)
+	j.mu.Lock()
+	j.subs[ch] = struct{}{}
+	j.mu.Unlock()
+
+	phases := map[string]bool{}
+	percents := []int{}
+	done := make(chan struct{})
+	go func() {
+		defer close(done)
+		for evt := range ch {
+			if evt.Type != "archive" || evt.Status != "running" {
+				continue
+			}
+			if evt.Phase != "" {
+				phases[evt.Phase] = true
+			}
+			percents = append(percents, evt.Percent)
+		}
+	}()
+
+	if _, err := a.extractOne(j, jobEvent{Type: "archive", ArchiveID: info.ID}, info, "alpha", "overwrite", false); err != nil {
+		t.Fatalf("extractOne failed: %v", err)
+	}
+	j.unsubscribe(ch)
+	<-done
+
+	if !phases["analyze"] || !phases["outer"] || !phases["nested"] || !phases["commit"] {
+		t.Fatalf("expected analyze/outer/nested/commit phases, got %#v", phases)
+	}
+	prev := -1
+	for _, p := range percents {
+		if p < prev {
+			t.Fatalf("percent went backwards: %v", percents)
+		}
+		prev = p
+	}
+}
+
+// A cancelled job must abort nested extraction with context.Canceled so the
+// caller does not commit a half-expanded payload.
+func TestExtractNestedAbortsOnCancel(t *testing.T) {
+	dir := t.TempDir()
+	for _, name := range []string{"001", "002"} {
+		if err := os.WriteFile(filepath.Join(dir, name), []byte("part"), 0o644); err != nil {
+			t.Fatal(err)
+		}
+	}
+	j := newJob()
+	j.cancel()
+
+	a := &app{}
+	tracker := &nestedTracker{j: j, base: jobEvent{Type: "archive", ArchiveID: "outer"}, start: 50, end: 100}
+	if _, err := a.extractNested(j, "", dir, false, map[string]bool{}, 0, tracker); !errors.Is(err, context.Canceled) {
+		t.Fatalf("expected context.Canceled, got %v", err)
+	}
+	if tracker.doneBytes != 0 {
+		t.Fatalf("cancelled extraction must not account work as done, got %d", tracker.doneBytes)
 	}
 }

@@ -27,6 +27,14 @@ const state = {
   elapsedTimer: null,
   searchTimer: null,
   extracting: false,
+  uiFlushTimer: null,
+  pendingUi: null,
+  displayedOverall: -1,
+  eventNodes: new Map(),
+  lastScrolledRow: "",
+  jobSpeed: 0,
+  jobBytesDone: 0,
+  jobBytesTotal: 0,
 };
 
 const $ = (id) => document.getElementById(id);
@@ -83,6 +91,15 @@ const els = {
   progressMeta: $("progressMeta"),
   progressCounts: $("progressCounts"),
   progressElapsed: $("progressElapsed"),
+  progressEta: $("progressEta"),
+  nowLine: $("nowLine"),
+  progressTitle: $("progressTitle"),
+  liveDot: $("liveDot"),
+  eventCount: $("eventCount"),
+  eventDisclosure: $("eventDisclosure"),
+  dockProgress: $("dockProgress"),
+  dockProgressBar: $("dockProgressBar"),
+  dockCancel: $("dockCancel"),
   content: document.querySelector(".content"),
 };
 
@@ -461,10 +478,11 @@ async function scan() {
     setStateText(data.archives.length ? "扫描完成" : "就绪", data.archives.length ? "done" : "idle");
     if (data.archives.length) {
       toast(`找到 ${data.archives.length} 个可解压文件`, "success");
-      // Soft-scroll results into view on small screens
-      els.resultList?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      if (window.innerWidth <= 980) {
+        els.resultList?.scrollIntoView({ behavior: "smooth", block: "nearest" });
+      }
     } else {
-      toast("未找到 zip / 7z / 分卷文件", "info");
+      toast("未找到 zip / 7z / wim / esd / 分卷文件", "info");
     }
   } catch (err) {
     showError(err);
@@ -487,11 +505,11 @@ function renderArchives() {
     els.resultList.innerHTML = state.hasScanned
       ? emptyMarkup(
           "没有找到文件",
-          `已扫描当前路径及最多 ${state.scanDepth} 层子目录${state.includeHidden ? "，并包含隐藏项" : ""}。支持 zip、7z 与分卷压缩包。`
+          `已扫描当前路径及最多 ${state.scanDepth} 层子目录${state.includeHidden ? "，并包含隐藏项" : ""}。支持 zip、7z、wim/esd/swm 与分卷压缩包。`
         )
       : emptyMarkup(
           "准备开始",
-          "在左侧进入存放压缩包的文件夹，点击「扫描此文件夹」。支持 zip、7z 与分卷。"
+          "在左侧进入存放压缩包的文件夹，点击「扫描此文件夹」。支持 zip、7z、wim/esd 与分卷。"
         );
     updateButtons();
     updateStats();
@@ -547,7 +565,7 @@ function buildArchiveRow(archive, index) {
   const percent = progressOf(event);
   row.className = `archive-row ${status}`.trim();
   row.dataset.id = archive.id;
-  row.style.animationDelay = `${Math.min(index, 12) * 28}ms`;
+  if (!state.currentJob) row.style.animationDelay = `${Math.min(index, 12) * 28}ms`;
 
   const suggested = archive.defaultPassword || "";
   const suggestedDecoded = decodePasswordSlang(suggested);
@@ -583,7 +601,7 @@ function buildArchiveRow(archive, index) {
       <div class="archive-dir" title="${escapeHtml(archive.directory)}">${escapeHtml(archive.relativeDir)}</div>
       ${
         status
-          ? `<div class="archive-status-line"><span class="status-chip ${status}">${escapeHtml(statusLabelFor(status, percent))}</span></div>
+          ? `<div class="archive-status-line"><span class="status-chip ${status}">${escapeHtml(statusLabelFor(status, percent, event.phase))}</span></div>
              <div class="archive-progress row-progress"><span style="width:${clamp(percent)}%"></span></div>`
           : ""
       }
@@ -634,10 +652,12 @@ function progressOf(event) {
   return Number.isFinite(event.percent) ? event.percent : 0;
 }
 
-function statusLabelFor(status, percent) {
+function statusLabelFor(status, percent, phase) {
   switch (status) {
     case "running":
-      return `解压中 ${percent || 0}%`;
+      if (phase === "analyze" && !percent) return "排队中";
+      if (phase === "commit") return "正在写入…";
+      return phase === "nested" ? `嵌套分卷 ${percent || 0}%` : `解压中 ${percent || 0}%`;
     case "done":
       return "已完成";
     case "failed":
@@ -687,21 +707,37 @@ function updateSegmentCounts() {
 
 function updateDock() {
   const selected = state.archives.filter((a) => a.selected).length;
-  const show = state.archives.length > 0 && !state.currentJob;
+  const extracting = Boolean(state.currentJob);
+  const show = state.archives.length > 0 || extracting;
   if (els.actionDock) {
     els.actionDock.hidden = !show;
+    els.actionDock.classList.toggle("is-live", extracting);
     document.body.classList.toggle("has-dock", show);
   }
-  document.body.classList.toggle("is-extracting", Boolean(state.currentJob));
-  if (els.content) els.content.classList.toggle("is-working", Boolean(state.currentJob));
-  if (els.progressPanel) els.progressPanel.classList.toggle("is-live", Boolean(state.currentJob));
-  if (els.dockCount) els.dockCount.textContent = `已选 ${selected} / ${state.archives.length}`;
+  document.body.classList.toggle("is-extracting", extracting);
+  if (els.content) els.content.classList.toggle("is-working", extracting);
+  if (els.progressPanel) els.progressPanel.classList.toggle("is-live", extracting);
+  if (els.liveDot) els.liveDot.hidden = !extracting;
+  if (els.dockProgress) els.dockProgress.hidden = !extracting;
+  if (els.dockCancel) els.dockCancel.hidden = !extracting;
+  if (els.dockExtract) els.dockExtract.hidden = extracting;
+  if (els.dockSelectAll) els.dockSelectAll.hidden = extracting;
+  if (els.dockCount) {
+    els.dockCount.textContent = extracting
+      ? els.progressCounts?.textContent || "解压中"
+      : `已选 ${selected} / ${state.archives.length}`;
+  }
   if (els.dockHint) {
-    const bytes = state.archives.filter((a) => a.selected).reduce((s, a) => s + (a.totalBytes || 0), 0);
-    els.dockHint.textContent =
-      selected === 0
-        ? "请至少选择一个文件"
-        : `约 ${formatBytes(bytes)} · 输出到各压缩包所在目录`;
+    if (extracting) {
+      const now = els.nowLine && !els.nowLine.hidden ? els.nowLine.textContent : "";
+      els.dockHint.textContent = now || els.jobSummary?.textContent || "正在解压…";
+    } else {
+      const bytes = state.archives.filter((a) => a.selected).reduce((s, a) => s + (a.totalBytes || 0), 0);
+      els.dockHint.textContent =
+        selected === 0
+          ? "请至少选择一个文件"
+          : `约 ${formatBytes(bytes)} · 输出到各压缩包所在目录`;
+    }
   }
   if (els.dockExtract) els.dockExtract.disabled = selected === 0;
   if (els.dockSelectAll) {
@@ -730,6 +766,7 @@ function tickElapsed() {
   const ms = Math.max(0, Date.now() - (state.jobStartedAt || Date.now()));
   els.progressElapsed.textContent = formatDuration(ms);
   updateProgressCounts();
+  updateEta(ms);
 }
 
 function updateProgressCounts() {
@@ -743,6 +780,25 @@ function updateProgressCounts() {
   }
   els.progressCounts.textContent =
     running > 0 ? `${finished} 完成 · ${running} 进行中 / ${total}` : `${finished} / ${total} 完成`;
+  if (state.currentJob && els.dockCount) els.dockCount.textContent = els.progressCounts.textContent;
+}
+
+function updateEta(elapsedMs) {
+  if (!els.progressEta) return;
+  const speed = state.jobSpeed;
+  const remainBytes = Math.max(0, state.jobBytesTotal - state.jobBytesDone);
+  if (state.currentJob && speed > 0 && remainBytes > 0 && elapsedMs > 1500) {
+    const remain = (remainBytes / speed) * 1000;
+    els.progressEta.textContent = `预计剩余 ${formatDuration(remain)} · ${formatBytes(speed)}/s`;
+    return;
+  }
+  const percent = state.displayedOverall;
+  if (!state.currentJob || percent < 3 || elapsedMs < 4000) {
+    els.progressEta.textContent = speed > 0 ? formatBytes(speed) + "/s" : "预计剩余 —";
+    return;
+  }
+  const remain = (elapsedMs * (100 - percent)) / percent;
+  els.progressEta.textContent = `预计剩余 ${formatDuration(remain)}`;
 }
 
 function formatDuration(ms) {
@@ -817,7 +873,7 @@ async function extract() {
   const conflictPolicy = els.conflictPolicy.value;
   if (els.deleteOriginal.checked) {
     const ok = window.confirm(
-      "你已开启「解压成功后删除原始分卷」。\n\n这是高风险操作，删除后无法自动恢复。是否继续？"
+      "你已开启「解压成功后删除原始压缩包（含分卷）」。\n\n这是高风险操作，删除后无法自动恢复。是否继续？"
     );
     if (!ok) {
       state.extracting = false;
@@ -842,9 +898,15 @@ async function extract() {
   state.lastJob = null;
   state.retryArchives = [];
   state.jobTotal = selected.length;
-  els.eventLog.innerHTML = "";
+  state.displayedOverall = 0;
+  resetEventLog();
   setOverallProgress(0);
   els.progressPanel.hidden = false;
+  if (els.progressTitle) els.progressTitle.textContent = "正在解压";
+  if (els.nowLine) {
+    els.nowLine.hidden = false;
+    els.nowLine.textContent = "正在连接进度…";
+  }
   hideJobResult();
   hideRetryPanel();
   hideResumeBanner();
@@ -853,7 +915,8 @@ async function extract() {
   startElapsedTimer();
   updateStepRail();
   updateDock();
-  els.progressPanel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  markRunningRows(selected);
+  revealProgress();
 
   try {
     const data = await api("/api/extract", {
@@ -1002,6 +1065,9 @@ function finishJobClient(status) {
   stopElapsedTimer();
   const outcome = outcomeOf(status);
   setStateText(outcome.pill, outcome.kind);
+  if (els.progressTitle) els.progressTitle.textContent = outcome.title;
+  if (els.nowLine) els.nowLine.hidden = true;
+  if (els.progressEta) els.progressEta.textContent = "已结束";
   updateButtons();
   updateDock();
   updateStepRail();
@@ -1049,16 +1115,22 @@ function closeJobStreams() {
 function handleJobEvent(event) {
   if (event.type === "job") {
     if (event.message) els.jobSummary.textContent = event.message;
+    if (event.current && els.nowLine) {
+      els.nowLine.hidden = false;
+      els.nowLine.textContent = event.current;
+    }
+    if (Number.isFinite(event.speedBps)) state.jobSpeed = event.speedBps;
+    if (Number.isFinite(event.bytesDone)) state.jobBytesDone = event.bytesDone;
+    if (Number.isFinite(event.bytesTotal)) state.jobBytesTotal = event.bytesTotal;
     if (event.total) state.jobTotal = event.total;
     if (isTerminalJobStatus(event.status) && event.status !== "cancelled") setOverallProgress(100);
     if (isTerminalJobStatus(event.status)) {
       state.lastJob = event;
+      flushPendingUi();
       renderJobResult();
       renderRetryPanel();
     }
-    updateOverall();
-    updateProgressCounts();
-    updateSegmentCounts();
+    scheduleUiFlush();
     return;
   }
 
@@ -1075,52 +1147,139 @@ function handleJobEvent(event) {
     next.percent = prev.percent;
   }
   if (["done", "failed", "warning"].includes(prev.status) && event.status === "running") {
-    next = prev;
-  } else {
-    state.events.set(key, next);
+    return;
   }
-  renderEventLog();
+  state.events.set(key, next);
+  const bucket = pendingBucket();
+  bucket.rows.add(key);
+  if (isNotableEvent(prev, next)) bucket.log = true;
+  if (next.status === "running" || next.message || next.error) bucket.now = next;
+  scheduleUiFlush();
+}
+
+function pendingBucket() {
+  if (!state.pendingUi) state.pendingUi = { rows: new Set(), log: false, now: null };
+  return state.pendingUi;
+}
+
+function isNotableEvent(prev, next) {
+  if (!prev.status || prev.status !== next.status) return true;
+  if ((prev.error || "") !== (next.error || "")) return true;
+  if ((prev.message || "") !== (next.message || "") && next.status !== "running") return true;
+  return false;
+}
+
+function scheduleUiFlush() {
+  if (state.uiFlushTimer) return;
+  state.uiFlushTimer = window.setTimeout(flushPendingUi, 120);
+}
+
+function flushPendingUi() {
+  if (state.uiFlushTimer) {
+    clearTimeout(state.uiFlushTimer);
+    state.uiFlushTimer = null;
+  }
+  const pending = state.pendingUi;
+  state.pendingUi = null;
   updateOverall();
   updateProgressCounts();
-  updateSegmentCounts();
-  patchArchiveRow(key);
+  updateEta(Math.max(0, Date.now() - (state.jobStartedAt || Date.now())));
+  if (!pending) return;
+  for (const id of pending.rows) patchArchiveRow(id);
+  if (pending.now) setNowLine(pending.now);
+  if (pending.log) patchEventLog();
+  if (state.currentJob) updateDock();
+}
+
+function setNowLine(event) {
+  if (!els.nowLine) return;
+  const name = event.archiveName || event.path || "当前文件";
+  const label = event.message || event.error || statusLabelFor(event.status, progressOf(event), event.phase);
+  const text = `${name} · ${label}`;
+  if (els.nowLine.textContent === text && !els.nowLine.hidden) return;
+  els.nowLine.hidden = false;
+  els.nowLine.textContent = text;
+  if (state.currentJob && els.dockHint && els.dockHint.textContent !== text) els.dockHint.textContent = text;
+}
+
+function markRunningRows(archives) {
+  for (const archive of archives) {
+    if (state.events.has(archive.id)) continue;
+    state.events.set(archive.id, {
+      type: "archive",
+      archiveId: archive.id,
+      archiveName: archive.name,
+      status: "running",
+      percent: 0,
+      phase: "analyze",
+      message: "排队中",
+    });
+  }
+  renderArchives();
+}
+
+function revealProgress() {
+  const panel = els.progressPanel;
+  if (!panel) return;
+  const reduce = window.matchMedia("(prefers-reduced-motion: reduce)").matches;
+  if (reduce) return;
+  requestAnimationFrame(() => {
+    const top = panel.getBoundingClientRect().top;
+    if (top < 72 || top > window.innerHeight - 120) {
+      panel.scrollIntoView({ behavior: "smooth", block: "nearest" });
+    }
+  });
+}
+
+function findArchiveRow(archiveId) {
+  if (!els.resultList) return null;
+  const id = String(archiveId);
+  for (const row of els.resultList.children) {
+    if (row.dataset && row.dataset.id === id) return row;
+  }
+  return null;
 }
 
 function patchArchiveRow(archiveId) {
-  let row;
-  try {
-    row = els.resultList.querySelector(`[data-id="${CSS.escape(archiveId)}"]`);
-  } catch (_) {
-    row = els.resultList.querySelector(`[data-id="${archiveId}"]`);
-  }
-  if (!row) {
-    if (state.archives.length <= 40) renderArchives();
-    return;
-  }
+  const row = findArchiveRow(archiveId);
+  if (!row) return;
   const event = state.events.get(archiveId) || {};
   const status = event.status || "";
   const percent = progressOf(event);
-  row.className = `archive-row ${status}`.trim();
+  const nextClass = `archive-row ${status}`.trim();
+  if (row.className !== nextClass) row.className = nextClass;
 
   let statusLine = row.querySelector(".archive-status-line");
   let progress = row.querySelector(".row-progress");
-  if (status) {
-    if (!statusLine) {
-      const main = row.querySelector(".archive-main");
-      statusLine = document.createElement("div");
-      statusLine.className = "archive-status-line";
-      statusLine.innerHTML = `<span class="status-chip ${status}"></span>`;
-      progress = document.createElement("div");
-      progress.className = "archive-progress row-progress";
-      progress.innerHTML = "<span></span>";
-      main.appendChild(statusLine);
-      main.appendChild(progress);
+  if (!status) return;
+  if (!statusLine) {
+    const main = row.querySelector(".archive-main");
+    if (!main) return;
+    statusLine = document.createElement("div");
+    statusLine.className = "archive-status-line";
+    statusLine.innerHTML = `<span class="status-chip ${status}"></span>`;
+    progress = document.createElement("div");
+    progress.className = "archive-progress row-progress";
+    progress.innerHTML = "<span></span>";
+    main.appendChild(statusLine);
+    main.appendChild(progress);
+  }
+  const chip = statusLine.querySelector(".status-chip");
+  const label = statusLabelFor(status, percent, event.phase);
+  if (chip.className !== `status-chip ${status}`) chip.className = `status-chip ${status}`;
+  if (chip.textContent !== label) chip.textContent = label;
+  const bar = progress?.querySelector("span");
+  if (bar) {
+    const width = `${clamp(percent)}%`;
+    if (bar.style.width !== width) bar.style.width = width;
+  }
+  if (status === "running" && state.lastScrolledRow !== archiveId) {
+    const rect = row.getBoundingClientRect();
+    const fullyHidden = rect.bottom < 80 || rect.top > window.innerHeight - 24;
+    if (fullyHidden) {
+      state.lastScrolledRow = archiveId;
+      row.scrollIntoView({ block: "nearest" });
     }
-    const chip = statusLine.querySelector(".status-chip");
-    chip.className = `status-chip ${status}`;
-    chip.textContent = statusLabelFor(status, percent);
-    const bar = progress?.querySelector("span");
-    if (bar) bar.style.width = `${clamp(percent)}%`;
   }
 }
 
@@ -1140,8 +1299,10 @@ function applyJobSnapshot(snap) {
     const key = event.archiveId || event.path;
     if (key) state.events.set(key, event);
   }
-  renderEventLog();
+  resetEventLog();
+  patchEventLog();
   updateOverall();
+  updateProgressCounts();
   renderArchives();
   if (state.lastJob) {
     renderJobResult();
@@ -1192,7 +1353,7 @@ function renderJobResult() {
     }</p>
     ${errorSummary}
   `;
-  els.jobResult.scrollIntoView({ behavior: "smooth", block: "nearest" });
+  if (!state.currentJob) els.jobResult.scrollIntoView({ behavior: "smooth", block: "nearest" });
 }
 
 function hideJobResult() {
@@ -1251,33 +1412,66 @@ function getVisibleArchives() {
   });
 }
 
-function renderEventLog() {
+function resetEventLog() {
+  state.eventNodes = new Map();
+  if (els.eventLog) els.eventLog.innerHTML = "";
+  if (els.eventCount) els.eventCount.textContent = "";
+}
+
+function patchEventLog() {
   if (!els.eventLog) return;
   const events = Array.from(state.events.values()).sort((a, b) => (a.index || 0) - (b.index || 0));
-  const html = events
-    .map((event) => {
-      const percent = progressOf(event);
-      const detail = event.error || event.message || event.path || "";
-      return `
-      <div class="event-item ${event.status || ""}">
-        <div class="event-title">
-          <span>${escapeHtml(event.archiveName || event.path || "任务")}</span>
-          <span>${percent}%</span>
-        </div>
-        <div class="archive-progress"><span style="width:${clamp(percent)}%"></span></div>
-        <div class="event-text">${escapeHtml(detail)}</div>
-      </div>`;
-    })
-    .join("");
-  els.eventLog.innerHTML = html;
-  const running = els.eventLog.querySelector(".event-item.running");
-  if (running) running.scrollIntoView({ block: "nearest", behavior: "smooth" });
+  const seen = new Set();
+  for (const event of events) {
+    const key = event.archiveId || event.path || event.type || "job";
+    seen.add(key);
+    const percent = progressOf(event);
+    const detail = event.error || event.message || event.path || "";
+    let node = state.eventNodes.get(key);
+    if (!node) {
+      node = document.createElement("div");
+      node.className = "event-item";
+      node.innerHTML = `
+        <div class="event-title"><span class="event-name"></span><span class="event-pct"></span></div>
+        <div class="archive-progress"><span></span></div>
+        <div class="event-text"></div>`;
+      state.eventNodes.set(key, node);
+      els.eventLog.appendChild(node);
+    }
+    const status = event.status || "";
+    if (node.dataset.status !== status) {
+      node.dataset.status = status;
+      node.className = `event-item ${status}`.trim();
+    }
+    const name = event.archiveName || event.path || "任务";
+    const nameEl = node.querySelector(".event-name");
+    const pctEl = node.querySelector(".event-pct");
+    const bar = node.querySelector(".archive-progress span");
+    const textEl = node.querySelector(".event-text");
+    if (nameEl.textContent !== name) nameEl.textContent = name;
+    const pct = `${percent}%`;
+    if (pctEl.textContent !== pct) pctEl.textContent = pct;
+    const width = `${clamp(percent)}%`;
+    if (bar.style.width !== width) bar.style.width = width;
+    if (textEl.textContent !== detail) textEl.textContent = detail;
+  }
+  for (const [key, node] of state.eventNodes) {
+    if (!seen.has(key)) {
+      node.remove();
+      state.eventNodes.delete(key);
+    }
+  }
+  if (els.eventCount) els.eventCount.textContent = events.length ? String(events.length) : "";
 }
 
 function setOverallProgress(percent) {
   const clamped = clamp(percent);
-  if (els.overallBar) els.overallBar.style.width = `${clamped}%`;
-  if (els.overallPercent) els.overallPercent.textContent = `${clamped}%`;
+  if (state.displayedOverall === clamped) return;
+  state.displayedOverall = clamped;
+  const width = `${clamped}%`;
+  if (els.overallBar) els.overallBar.style.width = width;
+  if (els.dockProgressBar) els.dockProgressBar.style.width = width;
+  if (els.overallPercent) els.overallPercent.textContent = width;
   if (els.overallBarHost) els.overallBarHost.setAttribute("aria-valuenow", String(clamped));
   if (els.overallRingValue) {
     const offset = RING_CIRCUMFERENCE * (1 - clamped / 100);
@@ -1286,7 +1480,11 @@ function setOverallProgress(percent) {
 }
 
 function updateOverall() {
-  const events = Array.from(state.events.values());
+  if (state.jobBytesTotal > 0 && state.currentJob) {
+    setOverallProgress(Math.min(99, Math.round((state.jobBytesDone * 100) / state.jobBytesTotal)));
+    return;
+  }
+  const events = Array.from(state.events.values()).filter((event) => event.type !== "job");
   const total = state.jobTotal || (events[0] && events[0].total) || events.length || 0;
   if (!total) {
     setOverallProgress(0);
@@ -1536,6 +1734,7 @@ els.copyPathButton?.addEventListener("click", () => copyCurrentPath());
 
 if (els.dockSelectAll) els.dockSelectAll.addEventListener("click", toggleSelectAll);
 if (els.dockExtract) els.dockExtract.addEventListener("click", extract);
+if (els.dockCancel) els.dockCancel.addEventListener("click", cancelJob);
 
 els.searchInput?.addEventListener("input", () => {
   if (els.searchClear) els.searchClear.hidden = !els.searchInput.value;

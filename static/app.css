@@ -724,6 +724,39 @@ h2 {
   opacity: 0.75;
 }
 
+.progress-copy {
+  min-width: 0;
+}
+
+.progress-kicker-row {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+}
+
+.live-dot {
+  width: 7px;
+  height: 7px;
+  border-radius: 50%;
+  background: var(--blue);
+  box-shadow: 0 0 0 0 color-mix(in srgb, var(--blue) 45%, transparent);
+  animation: pulse-dot 1.4s var(--ease) infinite;
+}
+
+.live-dot[hidden] { display: none; }
+
+.now-line {
+  margin: 6px 0 0;
+  font-size: 13px;
+  font-weight: 600;
+  color: var(--text);
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+
+.now-line[hidden] { display: none; }
+
 .progress-meta {
   display: flex;
   flex-wrap: wrap;
@@ -780,24 +813,11 @@ h2 {
 }
 
 .progress-panel.is-live::before {
-  content: "";
-  position: absolute;
-  left: 16px;
-  top: 18px;
-  width: 6px;
-  height: 6px;
-  border-radius: 50%;
-  background: var(--blue);
-  box-shadow: 0 0 0 0 color-mix(in srgb, var(--blue) 50%, transparent);
-  animation: pulse-dot 1.4s var(--ease) infinite;
+  content: none;
 }
 
 body.is-extracting {
   cursor: progress;
-}
-
-body.is-extracting .action-dock {
-  display: none !important;
 }
 
 .path-input {
@@ -1402,8 +1422,10 @@ body.is-extracting .action-dock {
   transition:
     border-color var(--duration) var(--ease),
     box-shadow var(--duration) var(--ease),
-    background var(--duration) var(--ease),
-    transform var(--duration) var(--ease);
+    background var(--duration) var(--ease);
+}
+
+body:not(.is-extracting) .archive-row {
   animation: row-in 0.35s var(--ease) both;
 }
 
@@ -1642,15 +1664,19 @@ body.is-extracting .action-dock {
 
 /* Progress panel */
 .progress-panel {
-  margin-top: 18px;
-  padding: 18px 18px 16px;
+  position: sticky;
+  top: calc(var(--topbar-h) + 8px);
+  z-index: 8;
+  margin: 4px 0 14px;
+  padding: 14px 16px 12px;
   border-radius: var(--radius-lg);
   border: 1px solid color-mix(in srgb, var(--blue) 22%, var(--line));
   background:
     linear-gradient(180deg, var(--blue-soft), transparent 48%),
-    var(--bg-solid);
+    color-mix(in srgb, var(--bg-solid) 92%, transparent);
+  backdrop-filter: saturate(160%) blur(16px);
+  -webkit-backdrop-filter: saturate(160%) blur(16px);
   box-shadow: var(--shadow-md);
-  animation: fade-up 0.4s var(--ease) both;
 }
 
 .progress-panel[hidden] { display: none; }
@@ -1714,7 +1740,8 @@ body.is-extracting .action-dock {
   position: relative;
 }
 
-.progress-panel:not([hidden]) .overall-bar span {
+.progress-panel.is-live .overall-bar span,
+.action-dock.is-live .dock-progress span {
   animation: shimmer 2.4s linear infinite;
 }
 
@@ -1723,13 +1750,36 @@ body.is-extracting .action-dock {
   100% { background-position: -100% 0; }
 }
 
+.event-disclosure {
+  margin-top: 4px;
+}
+
+.event-disclosure summary {
+  cursor: pointer;
+  font-size: 12.5px;
+  font-weight: 650;
+  color: var(--text-secondary);
+  list-style: none;
+}
+
+.event-disclosure summary::-webkit-details-marker { display: none; }
+
+.event-disclosure summary em {
+  font-style: normal;
+  font-variant-numeric: tabular-nums;
+  color: var(--text-tertiary);
+  margin-left: 4px;
+}
+
 .event-log {
   display: grid;
   gap: 6px;
-  max-height: 280px;
+  max-height: 220px;
   overflow: auto;
   overscroll-behavior: contain;
   padding-right: 2px;
+  margin-top: 8px;
+  contain: content;
 }
 
 .event-item {
@@ -1952,6 +2002,8 @@ body.is-extracting .action-dock {
 
 .action-dock-inner {
   pointer-events: auto;
+  position: relative;
+  overflow: hidden;
   width: min(720px, 100%);
   margin: 0 auto;
   display: flex;
@@ -1965,6 +2017,32 @@ body.is-extracting .action-dock {
   backdrop-filter: saturate(180%) blur(24px);
   -webkit-backdrop-filter: saturate(180%) blur(24px);
   box-shadow: var(--shadow-dock);
+}
+
+.dock-progress {
+  position: absolute;
+  left: 18px;
+  right: 18px;
+  bottom: 0;
+  height: 3px;
+  border-radius: 999px;
+  background: var(--bg-active);
+  overflow: hidden;
+}
+
+.dock-progress[hidden] { display: none; }
+
+.dock-progress span {
+  display: block;
+  width: 0;
+  height: 100%;
+  background: linear-gradient(90deg, #64b5ff, var(--blue) 50%, var(--purple));
+  background-size: 200% 100%;
+  transition: width 0.35s var(--ease);
+}
+
+.action-dock.is-live .action-dock-inner {
+  border-color: color-mix(in srgb, var(--blue) 35%, var(--line));
 }
 
 .action-dock-meta {
